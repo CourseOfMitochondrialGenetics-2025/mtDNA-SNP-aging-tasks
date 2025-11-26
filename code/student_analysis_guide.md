@@ -424,8 +424,3 @@ Findings consistent with Lobanova et al. showing age-related mtDNA heteroplasmy 
 ### Heteroplasmy Percentage
 \[ \text{Heteroplasmy %} = \text{Allele_frequency} \times 100 \]
 
----
-
-**Document Version:** 1.0  
-**Last Updated:** 26 November 2025  
-**For:** mtDNA Bioinformatics Course, University of Vienna

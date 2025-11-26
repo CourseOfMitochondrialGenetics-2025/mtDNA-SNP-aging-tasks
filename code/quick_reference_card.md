@@ -165,7 +165,3 @@ source("student_analysis_template.R")
 - **Course:** mtDNA Bioinformatics Practicum materials
 - **Reference:** Bibliography from main course docs
 
----
-
-**Last Updated:** 26 November 2025  
-**For:** mtDNA Analysis Practical, University of Vienna
