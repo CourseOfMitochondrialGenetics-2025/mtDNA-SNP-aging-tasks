@@ -1,44 +1,41 @@
-# mtDNA Variant Analysis Practical: Setup Guide
+# Практический анализ вариантов мтДНК: руководство по настройке
 
-## 1. Install R and RStudio (IDE)
+## 1. Установите R и RStudio (IDE)
 
--   Download [R](https://cran.r-project.org/)
--   Download [RStudio](https://posit.co/download/rstudio-desktop/) (Desktop is sufficient)
+-   Загрузите [R](https://cran.r-project.org/)
+-   Загрузите [RStudio](https://posit.co/download/rstudio-desktop/) (достаточно версии для настольных компьютеров)
 
-## 2. Essential R Libraries
+## 2. Необходимые библиотеки R
 
-Run this in R:
+Запустите в R:
 
-`install.packages(c('BiocManager', 'rmarkdown', 'Rsubread', 'QuasR', 'ggplot2', 'data.table', 'aws.s3'))` `BiocManager::install('GenomicAlignments')`
+`install.packages(c(„BiocManager“, „rmarkdown“, „Rsubread“, „QuasR“, „ggplot2“, „data.table“, „aws.s3“))` `BiocManager::install(„GenomicAlignments“)`
 
-For advanced analysis:
+## 3. Внешние инструменты
 
-`BiocManager::install('VariantAnnotation')`
+-   Загрузите и установите [GATK 4.x+](https://gatk.broadinstitute.org/)
+-   [Mutect2](https://gatk.broadinstitute.org/) является частью GATK (требуется Java 8+)
+-   Загрузите FASTA референсного генома человека (GRCh38): через [набор ресурсов GATK](https://gatk.broadinstitute.org/hc/en-us/articles/360035890811) или NCBI
 
-## 3. External Tools
+## 4. Подготовка данных
 
--   Download and install [GATK 4.x+](https://gatk.broadinstitute.org/)
--   [Mutect2](https://gatk.broadinstitute.org/) is part of GATK (requires Java 8+)
--   Download human reference genome (GRCh38) FASTA: via [GATK resource bundle](https://gatk.broadinstitute.org/hc/en-us/articles/360035890811) or NCBI
+-   Загрузите файлы FASTQ человека
+-   Загрузите референсный геном [GRCh38.p14] (https://ftp.ncbi.nlm.nih.gov/genomes/all/GCA/000/001/405/GCA_000001405.29_GRCh38.p14/GCA_000001405.29_GRCh38.p14_genomic.fna.gz)
 
-## 4. Data Preparation
+## 5. Обзор рабочего процесса
 
--   Download human FASTQ files
--   Download reference genome [GRCh38.p14](https://ftp.ncbi.nlm.nih.gov/genomes/all/GCA/000/001/405/GCA_000001405.29_GRCh38.p14/GCA_000001405.29_GRCh38.p14_genomic.fna.gz)
+-   Получение данных: загрузка исходных файлов FASTQ человека и справочных файлов.
+-   Установка инструментов: настройка R, RStudio и необходимых пакетов R/Bioconductor.
+-   Выравнивание чтений: сопоставление FASTQ со справочным геномом с помощью Rsubread или QuasR.
+-   Контроль качества и отчетность: визуализация и обобщение покрытия, проверка статистики сопоставления.
+-   Выявление вариантов и последующие действия: набросок или запуск Mutect2 (или использование готового конвейера MitoHPC).
+-   Интерпретация результатов: изучение обнаруженных вариантов, гетероплазмии и биологического значения.
 
-## 5. Workflow Overview
+## 6. Как запустить предоставленный блокнот R Markdown
 
--   Obtain data: Download human raw FASTQ and reference files.
--   Install tools: Set up R, RStudio, and required R/Bioconductor packages.
--   Align reads: Map FASTQ to the reference genome using Rsubread or QuasR.
--   Quality control and reporting: Visualize and summarize coverage, check mapping statistics.
--   Variant calling and downstream: Outline or trigger Mutect2 (or use finished MitoHPC pipeline).
--   Interpret results: Explore detected variants, heteroplasmy, and biological meaning.
-
-## 6. How to Run the Provided R Markdown Notebook
-
--   Open `alignment_and_variant_calling.Rmd` in RStudio.
--   Read through "Introduction" for biological background and step logic.
--   Run each code chunk in order (Ctrl+Shift+Enter) and follow the output and commentary.
--   Plots and tables will appear inline; results can be saved or rendered to HTML.
--   For variant calling, you may need to run a system command (see instructions, e.g., Mutect2) if BAM files are too large to handle in R. Results can be loaded back into R for summary and visualization.
+-   Откройте файл `alignment_and_variant_calling.Rmd` в RStudio.
+-   Прочитайте «Введение», чтобы ознакомиться с биологической информацией и логикой шагов.
+-   Запустите каждый фрагмент кода по порядку (Ctrl+Shift+Enter) и следуйте выводу и комментариям.
+-   Графики и таблицы появятся в IDE; результаты можно сохранить или преобразовать в HTML.
+-   Для rjkkbyuf вариантов может потребоваться запуск системной команды (см. инструкции, например, Mutect2), если файлы BAM слишком велики для обработки в R. 
+Результаты можно загрузить обратно в R для обобщения и визуализации.
