@@ -4,9 +4,11 @@ author: "Your Name"
 date: "`r Sys.Date()`"
 output: html_document
 ---
+
 ## 1. Introduction
 
-This document demonstrates alignment of raw human NGS reads to the mitochondrial reference genome and outlines variant calling for mtDNA using modern tools.
+This notebook demonstrates practical steps for analyzing mitochondrial DNA (mtDNA) variants from human NGS data—starting from raw FASTQ files, performing alignment, and supporting downstream variant detection.\
+We use open-access tools and real data for reproducibility and hands-on experience. See README for details.
 
 ## 2. Setup
 
@@ -18,23 +20,34 @@ library(GenomicAlignments)
 library(VariantAnnotation)
 library(ggplot2)
 library(data.table)
+library(aws.s3)
 ```
 
 ## 3. Download/Specify Inputs
 
-FASTQ files and reference genome should be present in the working directory.
+*Download the data using AWS CLI or SRA tools. FASTQ files and reference genome should be present in the working directory.*
 
 ```{r download}
+save_object(
+  object = "phase3/data/HG00096/sequence_read/SRR062634.filt.fastq.gz",
+  bucket = "1000genomes",
+  file = "SRR062634.filt.fastq.gz"
+)
 fastq_file <- 'SRR062634.filt.fastq.gz'
 ref_fasta <- 'GRCh38.fa'
 ```
 
 ## 4. Alignment
 
+*Indexing is needed only once for each reference genome version.*
+
 ```{r alignment, echo=FALSE}
 buildindex(basename="GRCh38_index", reference=ref_fasta)
 align(index="GRCh38_index", readfile1=fastq_file, output_file="aligned.bam")
 ```
+
+-   This command aligns your reads and creates a BAM file.
+-   The BAM file can be visualized in IGV or summarized in R.
 
 ## 5. BAM Summary and Visualization
 

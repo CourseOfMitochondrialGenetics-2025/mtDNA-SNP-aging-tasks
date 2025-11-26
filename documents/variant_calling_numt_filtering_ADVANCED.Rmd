@@ -1,0 +1,1082 @@
+---
+title: "mtDNA SNP/MNP Variant Calling and NUMT Filtering"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 3
+    fig_width: 10
+    fig_height: 6
+---
+
+# 1. Introduction and Background
+
+## 1.1 Overview
+
+This notebook demonstrates the complete workflow for calling single nucleotide variants (SNVs) and multi-nucleotide polymorphisms (MNPs) in mitochondrial DNA from aligned BAM files, with a strong focus on eliminating false-positive variants arising from **Nuclear Mitochondrial DNA sequences (NUMTs)**.
+
+After alignment of raw reads to the mitochondrial reference genome, we now enter the critical variant discovery and validation phase. The key challenge: distinguishing true mtDNA variants from artifacts introduced by NUMT contamination and sequencing errors.
+
+## 1.2 Why NUMT Filtering is Critical
+
+### What are NUMTs?
+
+- **Nuclear Mitochondrial DNA sequences (NUMTs)** are fragments of mtDNA that have been inserted into the nuclear genome over evolutionary time.
+- NUMTs can range from a few dozen base pairs to nearly complete mtDNA sequences.
+- When NGS reads are aligned to the mitochondrial reference genome, some NUMT-derived reads may also align to mtDNA, introducing **false-positive variants**.
+- Without proper filtering, NUMT contamination can lead to incorrect heteroplasmy estimates and spurious variant calls, potentially leading to misdiagnosis of mitochondrial diseases.
+
+### Why filter based on read quality and population databases?
+
+- **Read Quality Filters:** NUMTs typically accumulate more mutations than real mtDNA over evolutionary time, and NUMT-derived reads often have distinctive alignment patterns:
+  - Lower mapping quality (MAPQ)
+  - Strand bias (variants present predominantly on forward or reverse reads)
+  - Unusual insert sizes
+  - Higher mismatch rates
+  
+- **Population Database Filters:** By comparing detected variants against curated databases like gnomAD (mitochondrial), MITOMAP, and HmtDB, we can distinguish:
+  - Common, benign variants (present in many individuals worldwide)
+  - Known disease-associated variants (with clinical evidence)
+  - Rare or likely artifactual variants (potentially from NUMTs or sequencing errors)
+
+## 1.3 Key Concepts
+
+- **Heteroplasmy:** The percentage of mtDNA molecules in a cell carrying a particular variant (0–100%). Ranges from homoplasmy (100%, all copies have the variant) to very low-level heteroplasmy (<0.5%).
+- **Variant Allele Frequency (VAF):** Equivalent to heteroplasmy level; the proportion of reads carrying the alternate allele at a given position.
+- **Coverage Depth (DP):** The total number of reads overlapping a genomic position. Higher depth increases statistical confidence in variant calls, especially for low-frequency variants.
+- **Strand Bias (SB):** When a variant appears predominantly on forward reads or reverse reads (not balanced). Can indicate sequencing artifacts or NUMT contamination.
+- **Mapping Quality (MAPQ):** The Phred-scaled confidence that a read is aligned to the correct genomic location. Higher values (e.g., >30) indicate high-confidence alignments.
+- **Edit Distance:** The number of mismatches (substitutions, insertions, deletions) between a read and the reference genome. NUMT-derived reads often have high edit distances.
+
+---
+
+# 2. Setup and Library Loading
+
+```{r setup, message=FALSE, warning=FALSE}
+# Load essential libraries for variant analysis and visualization
+library(VariantAnnotation)  # For reading and manipulating VCF files
+library(GenomicAlignments)  # For working with aligned genomic data
+library(Rsamtools)          # For BAM file operations
+library(data.table)         # For efficient data manipulation
+library(ggplot2)            # For publication-quality plots
+library(dplyr)              # For data frame operations and piping
+library(scales)             # For plot scaling and formatting
+library(knitr)              # For table rendering
+
+# Set plotting defaults
+theme_set(theme_minimal() + theme(text = element_text(size = 12)))
+```
+
+### Why these libraries?
+
+- `VariantAnnotation`: Read, manipulate, and annotate VCF (variant call format) files—the standard format for storing variant information.
+- `GenomicAlignments`: Efficient handling of aligned genomic reads and BAM files.
+- `Rsamtools`: Direct interface to SAM/BAM file operations, enabling read-level filtering.
+- `data.table` and `dplyr`: High-performance data manipulation, essential for filtering large variant datasets.
+- `ggplot2` and `scales`: Create publication-quality plots with proper scaling.
+
+---
+
+# 3. Variant Calling from BAM Files
+
+## 3.1 Background on Variant Calling
+
+Variant calling is the computational process of identifying positions where aligned reads differ from the reference genome. For mtDNA, specialized variant callers must handle:
+
+- **Very high read depth:** mtDNA is present in hundreds to thousands of copies per cell, resulting in 100–10,000x coverage at mtDNA positions (vs. 30x typical for nuclear DNA).
+- **Low-frequency variants (heteroplasmy):** We need to reliably detect variants present in only a small fraction of mtDNA molecules (e.g., 0.5% heteroplasmy at 1000x depth = only 5 reads carrying the variant).
+- **Alignment artifacts:** Repetitive sequences, polyA tracts, and homopolymer runs cause errors that must be distinguished from true variants.
+
+## 3.2 Calling Variants with External Tools
+
+For reproducibility and best practices in mtDNA analysis, **we recommend using GATK Mutect2 or the specialized MitoHPC pipeline outside of R**, then importing results for filtering and interpretation.
+
+### Option A: GATK Mutect2 (Industry Standard)
+
+GATK's Mutect2 is specifically designed for detecting somatic variants and performs well for mtDNA analysis. Below is an example command:
+
+```bash
+# Install GATK if not already done (requires Java 8+)
+# wget https://github.com/broadinstitute/gatk/releases/download/4.3.0.0/gatk-4.3.0.0.zip
+# unzip gatk-4.3.0.0.zip
+
+# Run Mutect2 in mitochondria mode (optimized parameters for mtDNA)
+gatk Mutect2 \
+  -R GRCh38.fa \
+  -I aligned.bam \
+  -O variants.vcf.gz \
+  --mitochondria-mode \
+  --read-filter MappingQualityReadFilter \
+  --minimum-allele-fraction 0.005
+```
+
+**Explanation of parameters:**
+- `-R GRCh38.fa`: Reference genome FASTA file
+- `-I aligned.bam`: Input BAM file from previous alignment step
+- `-O variants.vcf.gz`: Output VCF (compressed)
+- `--mitochondria-mode`: Special mtDNA-optimized parameters
+- `--minimum-allele-fraction 0.005`: Detect variants down to 0.5% heteroplasmy
+- `--read-filter MappingQualityReadFilter`: Filter low-quality alignments
+
+### Option B: MitoHPC Pipeline (Specialized, Recommended)
+
+MitoHPC is a comprehensive pipeline specifically designed for mtDNA analysis, integrating alignment, variant calling, heteroplasmy quantification, and annotation.
+
+```bash
+# Clone MitoHPC repository
+git clone https://github.com/ArkingLab/MitoHPC.git
+cd MitoHPC
+
+# Follow the comprehensive README for installation and usage
+# Output includes: aligned BAM, VCF variants, heteroplasmy estimates, QC reports
+```
+
+**Advantages of MitoHPC:**
+- Designed specifically for mtDNA (uses appropriate default parameters)
+- Integrated NUMT filtering strategies
+- Automated heteroplasmy quantification
+- Comprehensive quality control
+- Single command execution
+
+## 3.3 Importing VCF Results into R
+
+Once variants have been called externally (Mutect2 or MitoHPC), import them into R for detailed filtering and analysis:
+
+```{r load-vcf, eval=FALSE}
+# Specify path to VCF file generated by Mutect2 or MitoHPC
+vcf_file <- "variants.vcf.gz"
+
+# Check file exists
+if (!file.exists(vcf_file)) {
+  stop("VCF file not found. Run variant caller first (Mutect2 or MitoHPC).")
+}
+
+# Load VCF with reference genome
+vcf <- readVcf(vcf_file, "hg38")
+
+cat("Total variants in VCF:", nrow(vcf), "\n")
+cat("VCF header information:\n")
+print(head(rowRanges(vcf)))
+
+# Access variant positions, alleles, and quality scores
+variants_basic <- data.frame(
+  position = start(rowRanges(vcf)),
+  ref = as.character(ref(vcf)),
+  alt = as.character(alt(vcf)),
+  qual = qual(vcf),
+  stringsAsFactors = FALSE
+)
+
+head(variants_basic, 10)
+```
+
+---
+
+# 4. Quality Filtering Based on Read Properties
+
+## 4.1 Overview of Quality Metrics
+
+For accurate, high-confidence mtDNA variant identification, we filter variants based on multiple quality metrics that characterize the alignment and read properties:
+
+- **QUAL score:** Phred-scaled confidence in the variant call (higher = better; formula: -10 × log₁₀(error probability))
+- **Depth (DP):** Total read depth at the variant position
+- **Allele Depth (AD):** Number of reads supporting each allele (reference and alternate)
+- **Variant Allele Frequency (VAF):** Ratio of alternate to total reads (indicator of heteroplasmy)
+- **Mapping Quality (MQ):** Quality of read alignment to reference (lower MAPQ suggests misalignment, possibly NUMT)
+- **Strand Bias (SB):** Imbalance between forward and reverse reads (forward bias indicates potential artifact)
+
+## 4.2 Recommended Quality Thresholds for mtDNA
+
+```{r quality-table}
+# Create comprehensive quality threshold table
+quality_thresholds <- data.frame(
+  Metric = c(
+    "QUAL Score",
+    "Depth (DP)",
+    "VAF/Heteroplasmy %",
+    "Mapping Quality (MQ)",
+    "Min Alternate Reads",
+    "Max Strand Bias %"
+  ),
+  Min_Threshold = c(30, 100, 0.5, 20, 5, 10),
+  Max_Threshold = c("-", "-", 100, "-", "-", "-"),
+  Rationale = c(
+    "Phred score of 30 = 0.1% error probability; moderate confidence",
+    "Adequate depth to distinguish signal from noise; reduces false positives",
+    "0.5% represents lowest detectable heteroplasmy at 100x depth; allows rare variant detection",
+    "Higher MAPQ = higher alignment confidence; excludes ambiguous or NUMT-derived reads",
+    "Minimum evidence for variant; prevents spurious single-read calls",
+    ">10% strand bias suggests artifact (forward or reverse bias); biological variants typically balanced"
+  )
+)
+
+knitr::kable(quality_thresholds, 
+             caption = "Table 1: Recommended Quality Thresholds for mtDNA SNP/MNP Calling")
+```
+
+## 4.3 Extract and Format Variant Information
+
+```{r extract-variant-info, eval=FALSE}
+# Extract comprehensive variant information from VCF
+
+# Basic variant information
+variant_df <- data.frame(
+  position = start(rowRanges(vcf)),
+  ref = as.character(ref(vcf)),
+  alt = as.character(alt(vcf)),
+  qual = qual(vcf),
+  stringsAsFactors = FALSE
+)
+
+# Extract FILTER field (high-quality variants should have PASS)
+variant_df$filter <- filt(vcf)
+
+# Extract genotype information (depth, allele counts)
+geno_data <- geno(vcf)
+
+# Extract DEPTH (DP field)
+if ("DP" %in% names(geno_data)) {
+  variant_df$depth <- as.numeric(geno_data$DP[, 1])
+} else {
+  warning("DP field not found in VCF; calculating from AD.")
+  variant_df$depth <- NA
+}
+
+# Extract ALLELE DEPTH (AD field: reference and alternate alleles)
+if ("AD" %in% names(geno_data)) {
+  ad_list <- geno_data$AD
+  # AD is stored as a list; extract first sample
+  ad_matrix <- as.matrix(ad_list)
+  variant_df$ref_reads <- as.numeric(ad_matrix[1, ])
+  variant_df$alt_reads <- as.numeric(ad_matrix[2, ])
+  
+  # Calculate VAF (heteroplasmy)
+  variant_df$total_reads <- variant_df$ref_reads + variant_df$alt_reads
+  variant_df$vaf <- variant_df$alt_reads / variant_df$total_reads
+  variant_df$heteroplasmy_pct <- variant_df$vaf * 100
+} else {
+  warning("AD field not found; VAF will not be calculated.")
+  variant_df$vaf <- NA
+}
+
+# Optional: Extract additional INFO fields (mapping quality, strand bias, etc.)
+info_data <- info(vcf)
+
+# Print summary statistics
+cat("\n=== Variant Quality Summary Before Filtering ===\n")
+cat("Total variants:", nrow(variant_df), "\n")
+cat("QUAL score range:", range(variant_df$qual, na.rm = TRUE), "\n")
+cat("Depth range:", range(variant_df$depth, na.rm = TRUE), "\n")
+cat("VAF/Heteroplasmy range (%):", 
+    range(variant_df$heteroplasmy_pct, na.rm = TRUE), "\n")
+
+head(variant_df, 15)
+```
+
+## 4.4 Apply Stringent Quality Filters
+
+```{r quality-filter, eval=FALSE}
+# Apply multi-layered quality filters
+cat("\n=== Applying Quality Filters ===\n")
+
+# Starting count
+n_start <- nrow(variant_df)
+cat("Starting variants:", n_start, "\n")
+
+# Step 1: Filter by QUAL score
+filtered_variants <- variant_df %>%
+  filter(qual >= 30)
+cat("After QUAL >= 30:", nrow(filtered_variants), 
+    "(removed:", n_start - nrow(filtered_variants), ")\n")
+
+# Step 2: Filter by FILTER field (keep only PASS)
+filtered_variants <- filtered_variants %>%
+  filter(filter == "PASS" | is.na(filter))
+cat("After FILTER == PASS:", nrow(filtered_variants), "\n")
+
+# Step 3: Filter by coverage depth (adequate coverage for variant detection)
+filtered_variants <- filtered_variants %>%
+  filter(depth >= 100)
+cat("After depth >= 100x:", nrow(filtered_variants), "\n")
+
+# Step 4: Filter by VAF (heteroplasmy) - retain only variants with adequate support
+filtered_variants <- filtered_variants %>%
+  filter(heteroplasmy_pct >= 0.5)
+cat("After heteroplasmy >= 0.5%:", nrow(filtered_variants), "\n")
+
+# Step 5: Filter by minimum alternate allele count (at least 5 reads supporting variant)
+filtered_variants <- filtered_variants %>%
+  filter(alt_reads >= 5)
+cat("After alt_reads >= 5:", nrow(filtered_variants), "\n")
+
+# Final summary
+n_removed <- n_start - nrow(filtered_variants)
+pct_retained <- round((nrow(filtered_variants) / n_start) * 100, 1)
+cat("\n=== Final Summary ===\n")
+cat("Variants after all quality filters:", nrow(filtered_variants), "\n")
+cat("Variants removed:", n_removed, "(", pct_retained, "% retained)\n")
+
+# Visualize heteroplasmy distribution
+p1 <- ggplot(filtered_variants, aes(x = heteroplasmy_pct)) +
+  geom_histogram(binwidth = 1, fill = "steelblue", color = "black", alpha = 0.7) +
+  labs(title = "Variant Allele Frequency (Heteroplasmy) Distribution",
+       subtitle = "After quality filtering",
+       x = "Heteroplasmy (%)",
+       y = "Number of Variants") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14))
+
+print(p1)
+
+# Visualize depth vs VAF
+p2 <- ggplot(filtered_variants, aes(x = depth, y = heteroplasmy_pct)) +
+  geom_point(size = 3, alpha = 0.6, color = "darkblue") +
+  scale_x_log10() +
+  labs(title = "Sequencing Depth vs Heteroplasmy",
+       x = "Coverage Depth (log scale)",
+       y = "Heteroplasmy (%)") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14))
+
+print(p2)
+```
+
+---
+
+# 5. NUMT Filtering Using Population Databases
+
+## 5.1 Available mtDNA Population Databases
+
+### gnomAD Mitochondrial (Genome Aggregation Database)
+- **URL:** https://gnomad.broadinstitute.org/
+- **Coverage:** ~17,000 sequenced individuals (v3.1)
+- **Data includes:** Allele frequencies, heteroplasmy levels, quality metrics
+- **Advantages:** Large, diverse population; high quality; easily accessible
+- **Download:** VCF files available at https://gnomad.broadinstitute.org/downloads
+
+### MITOMAP (Human Mitochondrial Genome Database)
+- **URL:** https://www.mitomap.org/
+- **Contains:** All reported mtDNA mutations, disease associations, population data
+- **Data includes:** Homoplasmic and heteroplasmic variants, clinical annotations, haplogroup info
+- **Advantages:** Comprehensive clinical annotation, long history, expert curation
+
+### HmtDB (Human Mitochondrial Database)
+- **URL:** https://www.hmtdb.unibo.it/
+- **Contains:** >3,000 complete mtDNA sequences, annotated with population and clinical data
+- **Data includes:** Sequence variation by population, haplogroup classification
+- **Advantages:** Population-specific frequency data
+
+## 5.2 Obtain and Prepare gnomAD mtDNA Reference Data
+
+### Download gnomAD mtDNA VCF
+
+```{r gnomad-download, eval=FALSE}
+# Download gnomAD v3.1 mtDNA variants
+# From https://gnomad.broadinstitute.org/ → Downloads → Mitochondrial DNA
+# File: gnomad.v3.1.sites.chrM.vcf.bgz (approximately 15 MB)
+
+gnomad_vcf_file <- "gnomad.v3.1.sites.chrM.vcf.bgz"
+
+# Check if file exists; if not, provide download instructions
+if (!file.exists(gnomad_vcf_file)) {
+  message("gnomAD mtDNA VCF not found. Download from:")
+  message("https://gnomad.broadinstitute.org/downloads")
+  message("\nCommand to download (requires ~15 MB):")
+  message("wget https://storage.googleapis.com/gnomad-public/release/3.1/vcf/mt/gnomad.v3.1.sites.chrM.vcf.bgz")
+  message("wget https://storage.googleapis.com/gnomad-public/release/3.1/vcf/mt/gnomad.v3.1.sites.chrM.vcf.bgz.tbi")
+}
+
+# Load gnomAD VCF
+gnomad_vcf <- readVcf(gnomad_vcf_file, "hg38")
+
+# Extract gnomAD population allele frequencies
+gnomad_variants <- data.frame(
+  position = start(rowRanges(gnomad_vcf)),
+  ref = as.character(ref(gnomad_vcf)),
+  alt = as.character(alt(gnomad_vcf)),
+  stringsAsFactors = FALSE
+)
+
+# Extract allele frequency from INFO field
+info_data <- info(gnomad_vcf)
+if ("AF" %in% names(info_data)) {
+  gnomad_variants$af_gnomad <- as.numeric(info_data$AF)
+} else {
+  message("AF field not found in gnomAD VCF.")
+}
+
+# Extract heteroplasmy information if available
+if ("nhomalt" %in% names(info_data)) {
+  gnomad_variants$nhomalt <- as.numeric(info_data$nhomalt)
+}
+
+cat("gnomAD mtDNA variants loaded:", nrow(gnomad_variants), "\n")
+cat("Variants with AF info:", sum(!is.na(gnomad_variants$af_gnomad)), "\n")
+
+head(gnomad_variants)
+```
+
+### Create Variant Identifiers for Matching
+
+```{r create-variant-ids, eval=FALSE}
+# Create unique variant identifiers (position + ref + alt)
+# This allows matching between our detected variants and reference databases
+
+filtered_variants <- filtered_variants %>%
+  mutate(
+    variant_id = paste0(position, "_", ref, "_", alt)
+  )
+
+gnomad_variants <- gnomad_variants %>%
+  mutate(
+    variant_id = paste0(position, "_", ref, "_", alt)
+  )
+
+cat("Unique variant IDs in our data:", 
+    n_distinct(filtered_variants$variant_id), "\n")
+cat("Unique variant IDs in gnomAD:", 
+    n_distinct(gnomad_variants$variant_id), "\n")
+```
+
+## 5.3 Cross-Reference Against gnomAD
+
+```{r numt-filter-database, eval=FALSE}
+# Left join: keep all our detected variants, add gnomAD information if available
+filtered_variants <- filtered_variants %>%
+  left_join(
+    gnomad_variants %>% select(variant_id, af_gnomad),
+    by = "variant_id"
+  )
+
+# Add flag indicating whether variant is in gnomAD
+filtered_variants <- filtered_variants %>%
+  mutate(
+    in_gnomad = !is.na(af_gnomad),
+    gnomad_status = ifelse(
+      in_gnomad,
+      "Present in gnomAD (known variant)",
+      "NOT in gnomAD (novel or NUMT-derived?)"
+    )
+  )
+
+# Summary statistics
+cat("\n=== gnomAD Database Comparison ===\n")
+cat("Total detected variants:", nrow(filtered_variants), "\n")
+cat("Variants in gnomAD:", sum(filtered_variants$in_gnomad), "\n")
+cat("Variants NOT in gnomAD:", sum(!filtered_variants$in_gnomad), "\n")
+cat("Percentage in gnomAD:", 
+    round((sum(filtered_variants$in_gnomad) / nrow(filtered_variants)) * 100, 1), "%\n")
+
+# Visualize gnomAD status
+p_gnomad <- ggplot(filtered_variants, aes(x = in_gnomad, fill = in_gnomad)) +
+  geom_bar(color = "black", alpha = 0.7) +
+  scale_fill_manual(values = c("FALSE" = "#d73027", "TRUE" = "#1a9850")) +
+  labs(title = "Variants Presence in gnomAD Database",
+       x = "In gnomAD",
+       y = "Number of Variants") +
+  theme_minimal() +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold", size = 14))
+
+print(p_gnomad)
+```
+
+## 5.4 Advanced Filtering: Confidence Assessment
+
+Not all variants absent from gnomAD are NUMTs. Some may be:
+- Rare, population-specific variants
+- Private, de novo variants
+- True variants with low population frequency
+
+We implement a **confidence scoring system**:
+
+```{r confidence-scoring, eval=FALSE}
+# Calculate confidence score for each variant
+filtered_variants <- filtered_variants %>%
+  mutate(
+    # Initialize confidence score
+    confidence_score = 0,
+    
+    # Add points for high-confidence attributes
+    confidence_score = confidence_score + 
+      ifelse(in_gnomad, 50, 0),                    # In gnomAD = +50 points
+    confidence_score = confidence_score + 
+      ifelse(depth > 200, 20, 0),                   # High depth = +20 points
+    confidence_score = confidence_score + 
+      ifelse(heteroplasmy_pct > 1, 15, 0),         # Higher VAF = +15 points
+    confidence_score = confidence_score + 
+      ifelse(alt_reads > 20, 15, 0),               # More variant reads = +15 points
+    
+    # Classification
+    variant_class = case_when(
+      confidence_score >= 70 ~ "HIGH CONFIDENCE",
+      confidence_score >= 40 ~ "MEDIUM CONFIDENCE",
+      TRUE ~ "LOW CONFIDENCE (possible NUMT)"
+    )
+  )
+
+# Summary by confidence class
+cat("\n=== Variant Confidence Classification ===\n")
+conf_summary <- filtered_variants %>%
+  group_by(variant_class) %>%
+  summarise(
+    count = n(),
+    mean_depth = round(mean(depth), 1),
+    mean_heteroplasmy = round(mean(heteroplasmy_pct), 2),
+    mean_af_gnomad = round(mean(af_gnomad, na.rm = TRUE), 6),
+    .groups = 'drop'
+  )
+print(conf_summary)
+
+# Visualize confidence scores
+p_conf <- ggplot(filtered_variants, aes(x = confidence_score, fill = variant_class)) +
+  geom_histogram(binwidth = 5, color = "black", alpha = 0.7) +
+  scale_fill_manual(values = c(
+    "HIGH CONFIDENCE" = "#1a9850",
+    "MEDIUM CONFIDENCE" = "#fee08b",
+    "LOW CONFIDENCE (possible NUMT)" = "#d73027"
+  )) +
+  labs(title = "Variant Confidence Score Distribution",
+       x = "Confidence Score",
+       y = "Number of Variants",
+       fill = "Classification") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14))
+
+print(p_conf)
+
+# Filter to keep only high and medium confidence variants
+high_confidence_variants <- filtered_variants %>%
+  filter(variant_class %in% c("HIGH CONFIDENCE", "MEDIUM CONFIDENCE"))
+
+cat("\n=== After Confidence Filtering ===\n")
+cat("Retained variants:", nrow(high_confidence_variants), "\n")
+cat("Removed (low confidence/possible NUMTs):", 
+    nrow(filtered_variants) - nrow(high_confidence_variants), "\n")
+```
+
+---
+
+# 6. Advanced NUMT Detection: Read-Level Analysis
+
+## 6.1 NUMT Characteristics at the Read Level
+
+NUMTs accumulate distinctive features due to their older evolutionary age and location in nuclear DNA:
+
+| Feature | True mtDNA Reads | NUMT-Derived Reads |
+|---------|-----------------|-------------------|
+| Mapping Quality (MAPQ) | High (>25) | Low (<15) |
+| Edit Distance / Mismatch Rate | Low (~0.5 per 100 bp) | High (~2-5 per 100 bp) |
+| Strand Distribution | Balanced | Often biased |
+| Alignment Score | High | Lower relative to length |
+| Insert Size | mtDNA-typical (~150 bp) | Variable/unusual |
+
+## 6.2 Read-Level NUMT Filtering
+
+```{r read-level-numt-analysis, eval=FALSE}
+# Detailed BAM file analysis for NUMT detection
+
+bam_file <- "aligned.bam"
+
+# Define scanning parameters to extract detailed read information
+param <- ScanBamParam(
+  what = c("rname", "pos", "mapq", "qwidth", "seq", "qual"),
+  tag = c("NM", "AS", "MD")  # NM = edit distance, AS = alignment score, MD = CIGAR
+)
+
+# Scan BAM file (may be large; consider subsetting for exploration)
+reads <- scanBam(bam_file, param = param)[[1]]
+
+# Convert to data frame for analysis
+reads_df <- data.frame(
+  position = reads$pos,
+  mapq = reads$mapq,
+  edit_distance = as.numeric(reads$tag$NM),
+  alignment_score = as.numeric(reads$tag$AS),
+  read_length = reads$qwidth,
+  stringsAsFactors = FALSE
+)
+
+# Calculate derived metrics
+reads_df <- reads_df %>%
+  mutate(
+    # Mismatch rate (errors per base pair)
+    mismatch_rate = edit_distance / read_length,
+    
+    # Normalized alignment score (AS / read length)
+    norm_alignment_score = alignment_score / read_length,
+    
+    # Flag potential NUMT reads
+    potential_numt = (mapq < 20) | (mismatch_rate > 0.05),
+    
+    # Risk level
+    read_risk = case_when(
+      mapq < 10 & mismatch_rate > 0.1 ~ "HIGH RISK",
+      mapq < 15 | mismatch_rate > 0.05 ~ "MEDIUM RISK",
+      TRUE ~ "LOW RISK"
+    )
+  )
+
+cat("\n=== Read-Level Analysis ===\n")
+cat("Total reads analyzed:", nrow(reads_df), "\n")
+cat("Potential NUMT reads:", sum(reads_df$potential_numt), 
+    "(", round((sum(reads_df$potential_numt) / nrow(reads_df)) * 100, 1), "%)\n")
+
+# Summarize by position
+position_summary <- reads_df %>%
+  group_by(position) %>%
+  summarise(
+    avg_mapq = mean(mapq),
+    avg_mismatch_rate = mean(mismatch_rate),
+    pct_potential_numt = sum(potential_numt) / n() * 100,
+    total_reads = n(),
+    .groups = 'drop'
+  )
+
+# Identify suspicious positions (>20% NUMT-like reads)
+suspicious_positions <- position_summary %>%
+  filter(pct_potential_numt > 20) %>%
+  arrange(desc(pct_potential_numt))
+
+cat("\nPositions with elevated NUMT-like read fractions:\n")
+print(head(suspicious_positions, 10))
+
+# Visualize mapping quality distribution
+p_mapq <- ggplot(reads_df, aes(x = mapq, fill = read_risk)) +
+  geom_histogram(binwidth = 2, color = "black", alpha = 0.7) +
+  scale_fill_manual(values = c(
+    "LOW RISK" = "#1a9850",
+    "MEDIUM RISK" = "#fee08b",
+    "HIGH RISK" = "#d73027"
+  )) +
+  labs(title = "Read Mapping Quality Distribution",
+       subtitle = "Colored by NUMT risk level",
+       x = "Mapping Quality (MAPQ)",
+       y = "Number of Reads",
+       fill = "Read Risk") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14))
+
+print(p_mapq)
+
+# Visualize mismatch rate
+p_mismatch <- ggplot(reads_df, aes(x = mismatch_rate * 100, fill = read_risk)) +
+  geom_histogram(binwidth = 0.5, color = "black", alpha = 0.7) +
+  scale_fill_manual(values = c(
+    "LOW RISK" = "#1a9850",
+    "MEDIUM RISK" = "#fee08b",
+    "HIGH RISK" = "#d73027"
+  )) +
+  labs(title = "Read Mismatch Rate Distribution",
+       subtitle = "Errors per base pair",
+       x = "Mismatch Rate (%)",
+       y = "Number of Reads",
+       fill = "Read Risk") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14))
+
+print(p_mismatch)
+```
+
+## 6.3 Flag and Remove Variants at Suspicious Positions
+
+```{r filter-suspicious-positions, eval=FALSE}
+# Merge read-level NUMT risk information back to variants
+high_confidence_variants <- high_confidence_variants %>%
+  left_join(
+    position_summary %>% select(position, pct_potential_numt),
+    by = "position"
+  ) %>%
+  mutate(
+    position_risk = case_when(
+      pct_potential_numt > 30 ~ "HIGH (>30% NUMT-like reads)",
+      pct_potential_numt > 15 ~ "MEDIUM (15-30% NUMT-like reads)",
+      TRUE ~ "LOW (<15% NUMT-like reads)"
+    )
+  )
+
+# Summary of position risk
+cat("\n=== Variant Position Risk Assessment ===\n")
+print(table(high_confidence_variants$position_risk))
+
+# Optionally, filter out variants at HIGH risk positions
+final_variants <- high_confidence_variants %>%
+  filter(position_risk != "HIGH (>30% NUMT-like reads)")
+
+cat("\nAfter removing variants at HIGH-risk positions:")
+cat("Retained variants:", nrow(final_variants), "\n")
+```
+
+---
+
+# 7. Haplogroup-Based Filtering and Consistency Check
+
+## 7.1 Why Haplogroup Classification?
+
+mtDNA haplogroups are defined by specific sets of diagnostic variants that evolved together on a single maternal lineage. By:
+1. Identifying the sample's haplogroup
+2. Comparing detected variants to expected haplogroup markers
+
+We can:
+- **Validate** that detected variants are consistent with the expected genetic background
+- **Identify** variants that don't match the haplogroup (potential NUMT artifacts)
+- **Prioritize** haplogroup-defining variants (expected, benign) vs. rare variants (potential disease or NUMT)
+
+## 7.2 Haplogroup-Defining Variants Reference
+
+```{r haplogroup-markers, eval=FALSE}
+# Simplified haplogroup markers (major European haplogroups)
+# Full haplogroup trees: PhyloTree.org, MITOMAP
+# Note: This is a small subset for demonstration
+
+haplogroup_markers <- data.frame(
+  haplogroup = c("H", "H", "H", "J", "J", "T", "T", "U", "U", "W", "W"),
+  position = c(7028, 16519, 16223, 185, 16069, 73, 153, 6392, 10398, 8994, 9477),
+  defining_variant = c("C", "G", "G", "C", "C", "G", "C", "C", "A", "T", "A"),
+  stringsAsFactors = FALSE
+)
+
+# Match detected variants against haplogroup markers
+variant_haplogroup_match <- high_confidence_variants %>%
+  left_join(
+    haplogroup_markers,
+    by = c("position" = "position", "alt" = "defining_variant")
+  ) %>%
+  mutate(
+    is_haplogroup_marker = !is.na(haplogroup)
+  )
+
+# Identify candidate haplogroup based on matching markers
+cat("\n=== Haplogroup Determination ===\n")
+haplogroup_summary <- variant_haplogroup_match %>%
+  filter(is_haplogroup_marker) %>%
+  group_by(haplogroup) %>%
+  summarise(
+    n_markers = n(),
+    .groups = 'drop'
+  ) %>%
+  arrange(desc(n_markers))
+
+if (nrow(haplogroup_summary) > 0) {
+  cat("Candidate haplogroup:", haplogroup_summary$haplogroup[1], 
+      "(based on", haplogroup_summary$n_markers[1], "matching markers)\n")
+} else {
+  cat("No haplogroup markers matched. May require full haplogroup classification.\n")
+}
+
+# Print variants at haplogroup positions
+cat("\nDetected haplogroup-defining variants:\n")
+print(variant_haplogroup_match %>%
+  filter(is_haplogroup_marker) %>%
+  select(position, ref, alt, haplogroup, heteroplasmy_pct))
+```
+
+---
+
+# 8. Summary, Output, and Visualization
+
+## 8.1 Prepare Final Filtered Variant Table
+
+```{r final-summary-table, eval=FALSE}
+# Create comprehensive final output table
+final_variants <- high_confidence_variants %>%
+  select(
+    position,
+    ref,
+    alt,
+    depth,
+    ref_reads,
+    alt_reads,
+    heteroplasmy_pct,
+    qual,
+    in_gnomad,
+    af_gnomad,
+    confidence_score,
+    variant_class
+  ) %>%
+  arrange(position) %>%
+  mutate(
+    af_gnomad = round(af_gnomad, 6),
+    heteroplasmy_pct = round(heteroplasmy_pct, 2)
+  )
+
+# Display summary
+cat("\n=== Final High-Confidence mtDNA Variants ===\n")
+cat("Total variants after all filtering:", nrow(final_variants), "\n\n")
+print(head(final_variants, 20))
+
+# Save to CSV for downstream analysis
+output_file <- "mtdna_variants_final_filtered.csv"
+write.csv(final_variants, output_file, row.names = FALSE)
+cat("\nVariants saved to:", output_file, "\n")
+
+# Summary statistics
+cat("\n=== Summary Statistics ===\n")
+cat("Mean depth:", round(mean(final_variants$depth), 1), "\n")
+cat("Mean heteroplasmy:", round(mean(final_variants$heteroplasmy_pct), 2), "%\n")
+cat("Median heteroplasmy:", round(median(final_variants$heteroplasmy_pct), 2), "%\n")
+cat("Range heteroplasmy:", 
+    paste0(round(min(final_variants$heteroplasmy_pct), 2), "%–", 
+           round(max(final_variants$heteroplasmy_pct), 2), "%"), "\n")
+cat("Variants in gnomAD:", sum(final_variants$in_gnomad), "\n")
+```
+
+## 8.2 Comprehensive Visualizations
+
+```{r visualizations, eval=FALSE}
+# Figure 1: mtDNA Variant Map
+p1 <- ggplot(final_variants, aes(x = position, y = heteroplasmy_pct, color = variant_class)) +
+  geom_point(size = 4, alpha = 0.7) +
+  geom_rug(aes(color = NULL), sides = "b", alpha = 0.3, size = 1) +
+  scale_color_manual(values = c(
+    "HIGH CONFIDENCE" = "#1a9850",
+    "MEDIUM CONFIDENCE" = "#fee08b"
+  )) +
+  scale_x_continuous(limits = c(1, 16569), expand = c(0, 0)) +
+  labs(title = "mtDNA Variant Map",
+       subtitle = "Position and heteroplasmy level of all detected variants",
+       x = "Position in mtDNA (bp)",
+       y = "Heteroplasmy (%)",
+       color = "Confidence") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+print(p1)
+
+# Figure 2: Coverage vs Heteroplasmy
+p2 <- ggplot(final_variants, aes(x = depth, y = heteroplasmy_pct, color = variant_class, size = alt_reads)) +
+  geom_point(alpha = 0.6) +
+  scale_x_log10() +
+  scale_size_continuous(name = "Alternate Reads", breaks = c(5, 10, 50, 100)) +
+  scale_color_manual(values = c(
+    "HIGH CONFIDENCE" = "#1a9850",
+    "MEDIUM CONFIDENCE" = "#fee08b"
+  )) +
+  labs(title = "Sequencing Depth vs Heteroplasmy",
+       x = "Coverage Depth (log scale)",
+       y = "Heteroplasmy (%)",
+       color = "Confidence") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14))
+
+print(p2)
+
+# Figure 3: Distribution of Heteroplasmy Levels
+p3 <- ggplot(final_variants, aes(x = heteroplasmy_pct, fill = variant_class)) +
+  geom_histogram(binwidth = 2, color = "black", alpha = 0.7) +
+  scale_fill_manual(values = c(
+    "HIGH CONFIDENCE" = "#1a9850",
+    "MEDIUM CONFIDENCE" = "#fee08b"
+  )) +
+  labs(title = "Distribution of Heteroplasmy Levels",
+       x = "Heteroplasmy (%)",
+       y = "Number of Variants",
+       fill = "Confidence") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14))
+
+print(p3)
+
+# Figure 4: gnomAD Allele Frequency Comparison
+p4 <- ggplot(final_variants %>% filter(in_gnomad), 
+             aes(x = af_gnomad, y = heteroplasmy_pct)) +
+  geom_point(size = 3, alpha = 0.6, color = "#1a9850") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", alpha = 0.5) +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(title = "Detected VAF vs gnomAD Population Frequency",
+       subtitle = "Variants present in gnomAD (log-log scale)",
+       x = "gnomAD Allele Frequency",
+       y = "Detected VAF (%)",
+       caption = "Diagonal line = perfect match between observed and population frequency") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14))
+
+print(p4)
+```
+
+---
+
+# 9. Biological Interpretation and Validation
+
+## 9.1 Key Distinguishing Features: True mtDNA vs NUMTs
+
+```{r interpretation-table}
+comparison_table <- data.frame(
+  Feature = c(
+    "Presence in gnomAD/MITOMAP",
+    "Coverage Depth",
+    "Read Quality (MAPQ)",
+    "Mismatch/Edit Distance",
+    "Strand Bias",
+    "Haplogroup Consistency",
+    "Heteroplasmy Pattern",
+    "Co-occurrence Patterns"
+  ),
+  True_mtDNA_Variants = c(
+    "Often present (common)",
+    "High and uniform",
+    "High (>25)",
+    "Low (~0.5-1%)",
+    "Minimal, balanced",
+    "Matches sample haplogroup",
+    "0.5%–100% (bell-shaped)",
+    "Phylogenetically coherent"
+  ),
+  NUMT_Derived_Variants = c(
+    "Rarely present",
+    "Variable, sometimes low",
+    "Low (<15)",
+    "High (2-5%)",
+    "Often pronounced",
+    "Inconsistent with haplogroup",
+    "Often <0.5% or sporadic",
+    "Random distribution"
+  )
+)
+
+knitr::kable(comparison_table, 
+             caption = "Table 2: Distinguishing Features of True mtDNA Variants vs NUMT-Derived Artifacts")
+```
+
+## 9.2 Recommended Validation Steps
+
+```{r validation-steps}
+validation_steps <- data.frame(
+  Step = c(
+    "1. Literature Review",
+    "2. Visual Inspection",
+    "3. Database Comparison",
+    "4. Functional Annotation",
+    "5. Independent Replication",
+    "6. Clinical Correlation"
+  ),
+  Action = c(
+    "Search MITOMAP, PubMed, mtDB for reported variants at detected positions",
+    "View aligned reads in IGV; check for artifacts, strand bias, or alignment issues",
+    "Compare detected VAF with gnomAD/MITOMAP frequencies; assess consistency",
+    "Determine coding impact, conservation; prioritize disease-associated variants",
+    "Re-run analysis with different variant caller or independent samples",
+    "If available, correlate variants with phenotype/disease status"
+  )
+)
+
+knitr::kable(validation_steps, 
+             caption = "Table 3: Recommended Validation Steps for mtDNA Variants")
+```
+
+---
+
+# 10. Conclusion and Next Steps
+
+## Summary
+
+This notebook provides a comprehensive, multi-layered approach to mtDNA SNP/MNP variant calling and NUMT filtering:
+
+1. **Quality filtering** based on read alignment metrics (QUAL, depth, VAF, MAPQ)
+2. **Population database cross-referencing** (gnomAD, MITOMAP, HmtDB)
+3. **Read-level NUMT detection** using mapping quality and edit distance metrics
+4. **Haplogroup consistency checking** to identify phylogenetically incongruent variants
+5. **Confidence scoring** integrating multiple evidence sources
+
+## Recommended Next Steps
+
+- **Functional annotation:** Determine coding impact (synonymous vs. non-synonymous) and conservation scores
+- **Heteroplasmy quantification:** If interested in low-level variants, apply specialized tools (MitoHPC, GATK-HC)
+- **Haplogroup assignment:** Full classification using haplogroup prediction tools
+- **Population comparison:** If cohort-level analysis, compare variant frequencies across populations
+- **Clinical interpretation:** If disease-related, consult clinical mtDNA databases and literature
+
+## Important Caveats
+
+- **Deep sequencing required:** Reliable heteroplasmy detection at <0.5% requires very high depth (>1000x)
+- **Technical artifacts:** Homopolymer regions and repetitive sequences are prone to polymerase errors
+- **NUMT contamination is ubiquitous:** Even with best practices, some NUMT contamination likely remains
+- **Validation is critical:** Always validate surprising or clinically important variants independently
+
+---
+
+# References
+
+[1] Barresi M. et al. (2025). "Bioinformatics Tools for NGS-Based Identification of Single Nucleotide Variants and Large-Scale Rearrangements in Mitochondrial DNA." BioTech, PMC11843820.
+
+[2] gnomAD Mitochondrial: https://gnomad.broadinstitute.org/
+
+[3] MITOMAP: https://www.mitomap.org/
+
+[4] HmtDB: https://www.hmtdb.unibo.it/
+
+[5] Wei W. et al. (2023). "The Mighty NUMT: Mitochondrial DNA Flexing Its Code in the Nuclear Genome." Biomolecules, PMC10216076.
+
+[6] MitoHPC: https://github.com/ArkingLab/MitoHPC
+
+[7] GATK Mutect2: https://gatk.broadinstitute.org/
+
+---
+
+**Document Information:**
+- **Encoding:** UTF-8
+- **Version:** 1.0
+- **Last Updated:** `r Sys.Date()`
+- **Author:** [Your Name]
+---
+title: "Human mtDNA Analysis: FASTQ Alignment"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+## 1. Introduction
+
+This notebook demonstrates practical steps for analyzing mitochondrial DNA (mtDNA) variants from human NGS data—starting from raw FASTQ files, performing alignment, and supporting downstream variant detection.\
+We use open-access tools and real data for reproducibility and hands-on experience. See README for details.
+
+## 2. Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(Rsubread)
+library(QuasR)
+library(GenomicAlignments)
+library(VariantAnnotation)
+library(ggplot2)
+library(data.table)
+library(aws.s3)
+```
+
+## 3. Download/Specify Inputs
+
+*Download the data using AWS CLI or SRA tools. FASTQ files and reference genome should be present in the working directory.*
+
+```{r download}
+save_object(
+  object = "phase3/data/HG00096/sequence_read/SRR062634.filt.fastq.gz",
+  bucket = "1000genomes",
+  file = "SRR062634.filt.fastq.gz"
+)
+fastq_file <- 'SRR062634.filt.fastq.gz'
+ref_fasta <- 'GRCh38.fa'
+```
+
+## 4. Alignment
+
+*Indexing is needed only once for each reference genome version.*
+
+```{r alignment, echo=FALSE}
+buildindex(basename="GRCh38_index", reference=ref_fasta)
+align(index="GRCh38_index", readfile1=fastq_file, output_file="aligned.bam")
+```
+
+-   This command aligns your reads and creates a BAM file.
+-   The BAM file can be visualized in IGV or summarized in R.
+
+## 5. BAM Summary and Visualization
+
+```{r plot, echo=FALSE}
+summary <- qQC("aligned.bam", genome=ref_fasta)
+plot(summary$coverage)
+```
