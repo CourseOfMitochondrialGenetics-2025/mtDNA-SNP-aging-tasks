@@ -1,9 +1,3 @@
----
-editor_options: 
-  markdown: 
-    wrap: sentence
----
-
 # mtDNA Variant Analysis Practical: Setup Guide
 
 ## 1. Install R and RStudio (IDE)

@@ -1,0 +1,532 @@
+---
+title: "Human mtDNA Analysis: FASTQ Alignment"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(Rsubread)
+library(QuasR)
+library(GenomicAlignments)
+library(VariantAnnotation)
+library(ggplot2)
+library(data.table)
+library(aws.s3)
+```
+
+# ============================================================================
+# SECTION: BATCH PROCESSING MULTIPLE FASTQ FILES
+# ============================================================================
+# This section demonstrates how to process multiple human FASTQ files in a
+# high-throughput manner, aligning each to the human reference genome and
+# generating alignment statistics for quality control.
+#
+# Purpose: Automate alignment of multiple samples from 1000 Genomes or similar
+# datasets, enabling cohort-level mtDNA analysis.
+# ============================================================================
+
+#1 Define Input and Output Directories
+
+```{r setup-batch-processing}
+# Specify directories
+fastq_input_dir <- "./fastq_files"        # Directory containing FASTQ files
+output_dir <- "./alignment_results"       # Directory for BAM files
+bam_index_dir <- file.path(output_dir, "bam_files")
+stats_dir <- file.path(output_dir, "alignment_stats")
+logs_dir <- file.path(output_dir, "logs")
+
+# Create output directories if they don't exist
+dir.create(fastq_input_dir, showWarnings = FALSE)
+dir.create(output_dir, showWarnings = FALSE)
+dir.create(bam_index_dir, showWarnings = FALSE)
+dir.create(stats_dir, showWarnings = FALSE)
+dir.create(logs_dir, showWarnings = FALSE)
+
+cat("Input directory:", fastq_input_dir, "\n")
+cat("Output directory:", output_dir, "\n")
+```
+
+# 2 Discover and List FASTQ Files
+
+```{r discover-fastq-files}
+# Find all FASTQ files in the input directory
+# Supports multiple FASTQ naming conventions: .fastq, .fq, .fastq.gz, .fq.gz
+
+fastq_files <- list.files(
+  path = fastq_input_dir,
+  pattern = "\\.(fastq|fq)(\\.(gz|bz2))?$",
+  full.names = TRUE,
+  recursive = TRUE
+)
+
+cat("Total FASTQ files found:", length(fastq_files), "\n\n")
+
+# For paired-end sequencing, you may need to pair R1 and R2 files
+# Extract sample names and identify R1/R2 reads
+sample_metadata <- data.frame(
+  full_path = fastq_files,
+  filename = basename(fastq_files),
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    # Extract sample ID (assumes naming like: SampleID_R1.fastq.gz or SampleID.R1.fq.gz)
+    sample_id = stringr::str_replace(filename, "_R[12].*", "") %>%
+                stringr::str_replace("\\.(R[12]).*", ""),
+    # Identify read direction
+    read_direction = ifelse(grepl("_R1|.R1", filename), "R1",
+                           ifelse(grepl("_R2|.R2", filename), "R2", "SE")),
+    # File size in MB
+    file_size_mb = file.size(full_path) / (1024^2)
+  )
+
+# Display sample metadata
+cat("=== FASTQ File Metadata ===\n")
+print(head(sample_metadata, 20))
+cat("\nTotal unique samples:", n_distinct(sample_metadata$sample_id), "\n")
+
+# For paired-end reads, pair R1 and R2
+if (any(sample_metadata$read_direction == "R1")) {
+  paired_samples <- sample_metadata %>%
+    pivot_wider(
+      names_from = read_direction,
+      values_from = full_path,
+      id_cols = sample_id
+    ) %>%
+    filter(!is.na(R1))  # Keep only samples with R1
+  
+  cat("\nPaired-end samples found:", nrow(paired_samples), "\n")
+} else {
+  # Single-end sequencing
+  paired_samples <- sample_metadata %>%
+    select(sample_id, SE) %>%
+    rename(fastq_file = SE) %>%
+    mutate(is_paired = FALSE)
+  
+  cat("\nSingle-end samples found:", nrow(paired_samples), "\n")
+}
+
+head(paired_samples)
+```
+
+# 3 Reference Genome Preparation
+
+```{r prepare-reference-genome}
+# Specify reference genome path
+ref_genome <- "GRCh38.fa"
+ref_genome_index <- "GRCh38_index"
+
+# Check if reference exists; if not, provide instructions
+if (!file.exists(ref_genome)) {
+  cat("Reference genome not found!\n")
+  cat("Download from: https://gatk.broadinstitute.org/hc/en-us/articles/360035890811\n")
+  cat("\nOr use NCBI reference:\n")
+  cat("wget ftp://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/001/405/GCF_000001405.40-RS_GCF_000001405.40/GCF_000001405.40_GRCh38.p14_genomic.fna.gz\n")
+}
+
+# Build Rsubread index (one-time operation)
+if (!file.exists(paste0(ref_genome_index, ".reads"))) {
+  cat("\nBuilding Rsubread index... This may take several minutes.\n")
+  
+  buildindex(
+    basename = ref_genome_index,
+    reference = ref_genome,
+    indexSplit = FALSE,
+    memory = 8000  # 8GB RAM allocation
+  )
+  
+  cat("Index built successfully.\n")
+} else {
+  cat("Index already exists. Skipping index building.\n")
+}
+
+cat("Reference genome:", ref_genome, "\n")
+cat("Index basename:", ref_genome_index, "\n")
+```
+
+# 4 Batch Alignment Function
+
+```{r define-alignment-function}
+# Define a reusable function for single-sample alignment
+
+align_sample <- function(
+  sample_id,
+  fastq_r1,
+  fastq_r2 = NULL,
+  index_basename,
+  output_bam,
+  output_stats_file,
+  output_log_file,
+  n_threads = 4,
+  verbose = TRUE
+) {
+  
+  # Log initialization
+  log_messages <- c()
+  log_messages <- c(log_messages, paste("Sample:", sample_id))
+  log_messages <- c(log_messages, paste("Start time:", Sys.time()))
+  
+  tryCatch({
+    if (verbose) cat("Processing sample:", sample_id, "\n")
+    
+    # Determine if paired-end or single-end
+    is_paired <- !is.null(fastq_r2)
+    
+    if (is_paired) {
+      log_messages <- c(log_messages, "Sequencing type: Paired-end")
+      if (verbose) cat("  - Paired-end sequencing detected\n")
+      
+      align(
+        index = index_basename,
+        readfile1 = fastq_r1,
+        readfile2 = fastq_r2,
+        type = "gBAM",
+        output_file = output_bam,
+        nthreads = n_threads,
+        maxMissingBases = 3,
+        sortReadsByCoordinate = TRUE
+      )
+    } else {
+      log_messages <- c(log_messages, "Sequencing type: Single-end")
+      if (verbose) cat("  - Single-end sequencing detected\n")
+      
+      align(
+        index = index_basename,
+        readfile1 = fastq_r1,
+        type = "gBAM",
+        output_file = output_bam,
+        nthreads = n_threads,
+        maxMissingBases = 3,
+        sortReadsByCoordinate = TRUE
+      )
+    }
+    
+    # Read BAM file and calculate statistics
+    bam_file <- output_bam
+    
+    if (file.exists(bam_file)) {
+      # Use Rsamtools to get basic statistics
+      what <- c("rname", "pos", "mapq", "qwidth")
+      param <- ScanBamParam(what = what)
+      reads <- scanBam(bam_file, param = param)[[1]]
+      
+      # Calculate statistics
+      total_reads <- nrow(reads)
+      mapped_reads <- sum(reads$mapq > 0, na.rm = TRUE)
+      unmapped_reads <- total_reads - mapped_reads
+      mapping_rate <- (mapped_reads / total_reads) * 100
+      
+      avg_mapq <- mean(reads$mapq, na.rm = TRUE)
+      avg_read_length <- mean(reads$qwidth, na.rm = TRUE)
+      
+      # mtDNA-specific statistics
+      mtdna_reads <- sum(reads$rname == "chrM", na.rm = TRUE)
+      mtdna_mapping_rate <- (mtdna_reads / total_reads) * 100
+      
+      # Create statistics data frame
+      stats_df <- data.frame(
+        sample_id = sample_id,
+        total_reads = total_reads,
+        mapped_reads = mapped_reads,
+        unmapped_reads = unmapped_reads,
+        mapping_rate_pct = round(mapping_rate, 2),
+        avg_mapq = round(avg_mapq, 2),
+        avg_read_length = round(avg_read_length, 2),
+        mtdna_reads = mtdna_reads,
+        mtdna_mapping_rate_pct = round(mtdna_mapping_rate, 2),
+        bam_file = bam_file,
+        alignment_status = "SUCCESS"
+      )
+      
+      # Update log
+      log_messages <- c(log_messages,
+        paste("Total reads:", total_reads),
+        paste("Mapped reads:", mapped_reads),
+        paste("Mapping rate:", round(mapping_rate, 2), "%"),
+        paste("mtDNA reads:", mtdna_reads),
+        paste("mtDNA mapping rate:", round(mtdna_mapping_rate, 2), "%"),
+        paste("Average MAPQ:", round(avg_mapq, 2)),
+        paste("Average read length:", round(avg_read_length, 2), "bp")
+      )
+      
+      if (verbose) {
+        cat("  - Total reads:", total_reads, "\n")
+        cat("  - Mapped reads:", mapped_reads, "(", 
+            round(mapping_rate, 2), "%)\n")
+        cat("  - mtDNA reads:", mtdna_reads, "(", 
+            round(mtdna_mapping_rate, 2), "%)\n")
+      }
+    } else {
+      warning("BAM file not created for sample: ", sample_id)
+      stats_df <- data.frame(
+        sample_id = sample_id,
+        alignment_status = "FAILED"
+      )
+    }
+    
+    # Save statistics
+    write.csv(stats_df, output_stats_file, row.names = FALSE)
+    
+    # Add completion info to log
+    log_messages <- c(log_messages,
+      paste("End time:", Sys.time()),
+      "Status: COMPLETED SUCCESSFULLY"
+    )
+    
+  }, error = function(e) {
+    log_messages <<- c(log_messages,
+      paste("ERROR:", e$message),
+      "Status: FAILED"
+    )
+    cat("ERROR aligning sample", sample_id, ":", e$message, "\n")
+  })
+  
+  # Write log file
+  writeLines(log_messages, output_log_file)
+  
+  return(stats_df)
+}
+```
+
+# 5 Execute Batch Alignment
+
+```{r execute-batch-alignment}
+# Process all samples with progress tracking
+
+cat("\n=== STARTING BATCH ALIGNMENT ===\n")
+cat("Number of samples to process:", nrow(paired_samples), "\n")
+cat("Threads per sample:", 4, "\n")
+cat("Estimated total time: depends on file sizes and system resources\n\n")
+
+# Initialize results storage
+all_stats <- list()
+alignment_summary <- data.frame()
+
+# Process each sample
+for (i in seq_len(nrow(paired_samples))) {
+  sample_id <- paired_samples$sample_id[i]
+  
+  cat("\n[", i, "/", nrow(paired_samples), "]", "Processing:", sample_id, "\n")
+  
+  # Define output file paths
+  bam_output <- file.path(bam_index_dir, paste0(sample_id, ".bam"))
+  stats_file <- file.path(stats_dir, paste0(sample_id, "_alignment_stats.csv"))
+  log_file <- file.path(logs_dir, paste0(sample_id, "_alignment.log"))
+  
+  # Get FASTQ files
+  fastq_r1 <- paired_samples$R1[i]
+  fastq_r2 <- if ("R2" %in% names(paired_samples)) paired_samples$R2[i] else NULL
+  
+  # Run alignment
+  sample_stats <- align_sample(
+    sample_id = sample_id,
+    fastq_r1 = fastq_r1,
+    fastq_r2 = fastq_r2,
+    index_basename = ref_genome_index,
+    output_bam = bam_output,
+    output_stats_file = stats_file,
+    output_log_file = log_file,
+    n_threads = 4,
+    verbose = TRUE
+  )
+  
+  # Store results
+  all_stats[[sample_id]] <- sample_stats
+  alignment_summary <- rbind(alignment_summary, sample_stats)
+}
+
+cat("\n=== BATCH ALIGNMENT COMPLETE ===\n")
+```
+
+# 6 Consolidate and Analyze Results
+
+```{r consolidate-batch-results}
+# Combine all statistics into a single summary table
+
+batch_alignment_summary <- bind_rows(all_stats)
+
+cat("\n=== BATCH ALIGNMENT SUMMARY ===\n\n")
+print(batch_alignment_summary)
+
+# Save consolidated summary
+summary_file <- file.path(output_dir, "batch_alignment_summary.csv")
+write.csv(batch_alignment_summary, summary_file, row.names = FALSE)
+
+cat("\nSummary statistics saved to:", summary_file, "\n")
+
+# Calculate aggregate statistics
+cat("\n=== AGGREGATE STATISTICS ===\n")
+cat("Total samples processed:", nrow(batch_alignment_summary), "\n")
+cat("Successful alignments:", sum(batch_alignment_summary$alignment_status == "SUCCESS", na.rm = TRUE), "\n")
+cat("Failed alignments:", sum(batch_alignment_summary$alignment_status == "FAILED", na.rm = TRUE), "\n")
+cat("\nMean mapping rate:", 
+    round(mean(batch_alignment_summary$mapping_rate_pct, na.rm = TRUE), 2), "%\n")
+cat("Mean mtDNA mapping rate:", 
+    round(mean(batch_alignment_summary$mtdna_mapping_rate_pct, na.rm = TRUE), 2), "%\n")
+cat("Mean MAPQ:", 
+    round(mean(batch_alignment_summary$avg_mapq, na.rm = TRUE), 2), "\n")
+```
+
+# 7 Visualize Batch Alignment Quality
+
+```{r visualize-batch-alignment}
+# Create comprehensive QC plots for all samples
+
+# Plot 1: Mapping rate per sample
+p_mapping_rate <- ggplot(batch_alignment_summary, 
+                         aes(x = reorder(sample_id, mapping_rate_pct), 
+                             y = mapping_rate_pct)) +
+  geom_col(fill = "steelblue", color = "black", alpha = 0.7) +
+  geom_hline(yintercept = mean(batch_alignment_summary$mapping_rate_pct, na.rm = TRUE), 
+             linetype = "dashed", color = "red", size = 1) +
+  labs(
+    title = "Mapping Rate per Sample",
+    subtitle = "Red line = mean across all samples",
+    x = "Sample ID",
+    y = "Mapping Rate (%)"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    plot.title = element_text(face = "bold", size = 14)
+  )
+
+print(p_mapping_rate)
+
+# Plot 2: mtDNA mapping rate distribution
+p_mtdna_dist <- ggplot(batch_alignment_summary, 
+                       aes(x = mtdna_mapping_rate_pct)) +
+  geom_histogram(binwidth = 0.5, fill = "darkgreen", color = "black", alpha = 0.7) +
+  geom_vline(aes(xintercept = mean(mtdna_mapping_rate_pct, na.rm = TRUE)),
+             linetype = "dashed", color = "red", size = 1) +
+  labs(
+    title = "Distribution of mtDNA Mapping Rates",
+    x = "mtDNA Mapping Rate (%)",
+    y = "Number of Samples"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14))
+
+print(p_mtdna_dist)
+
+# Plot 3: Total reads per sample
+p_read_depth <- ggplot(batch_alignment_summary, 
+                       aes(x = reorder(sample_id, total_reads), 
+                           y = total_reads / 1e6)) +
+  geom_col(fill = "orange", color = "black", alpha = 0.7) +
+  labs(
+    title = "Read Depth per Sample",
+    x = "Sample ID",
+    y = "Total Reads (millions)"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    plot.title = element_text(face = "bold", size = 14)
+  )
+
+print(p_read_depth)
+
+# Plot 4: MAPQ distribution
+p_mapq_dist <- ggplot(batch_alignment_summary, 
+                      aes(x = avg_mapq, fill = alignment_status)) +
+  geom_histogram(binwidth = 1, color = "black", alpha = 0.7) +
+  scale_fill_manual(values = c("SUCCESS" = "#1a9850", "FAILED" = "#d73027")) +
+  labs(
+    title = "Distribution of Average MAPQ Scores",
+    x = "Average MAPQ",
+    y = "Number of Samples",
+    fill = "Status"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14))
+
+print(p_mapq_dist)
+```
+
+# 8 Sample Filtering and QC Thresholds
+
+```{r apply-qc-thresholds}
+# Define and apply QC thresholds for sample inclusion/exclusion
+
+qc_thresholds <- list(
+  min_mapping_rate = 80,          # Minimum mapping rate %
+  min_mtdna_rate = 5,              # Minimum mtDNA mapping %
+  min_avg_mapq = 20,               # Minimum average MAPQ
+  min_total_reads = 1e6            # Minimum 1 million reads
+)
+
+cat("\n=== APPLYING QC THRESHOLDS ===\n")
+cat("Minimum mapping rate:", qc_thresholds$min_mapping_rate, "%\n")
+cat("Minimum mtDNA rate:", qc_thresholds$min_mtdna_rate, "%\n")
+cat("Minimum MAPQ:", qc_thresholds$min_avg_mapq, "\n")
+cat("Minimum total reads:", qc_thresholds$min_total_reads, "\n\n")
+
+# Apply filters
+qc_passed <- batch_alignment_summary %>%
+  filter(
+    mapping_rate_pct >= qc_thresholds$min_mapping_rate,
+    mtdna_mapping_rate_pct >= qc_thresholds$min_mtdna_rate,
+    avg_mapq >= qc_thresholds$min_avg_mapq,
+    total_reads >= qc_thresholds$min_total_reads,
+    alignment_status == "SUCCESS"
+  )
+
+cat("Samples passing QC:", nrow(qc_passed), "/", nrow(batch_alignment_summary), "\n")
+cat("Samples failing QC:", nrow(batch_alignment_summary) - nrow(qc_passed), "\n")
+
+# Display passing and failing samples
+cat("\n=== SAMPLES PASSING QC ===\n")
+print(qc_passed %>% select(sample_id, mapping_rate_pct, mtdna_mapping_rate_pct, avg_mapq))
+
+qc_failed <- batch_alignment_summary %>%
+  anti_join(qc_passed, by = "sample_id")
+
+if (nrow(qc_failed) > 0) {
+  cat("\n=== SAMPLES FAILING QC ===\n")
+  print(qc_failed %>% select(sample_id, mapping_rate_pct, mtdna_mapping_rate_pct, avg_mapq))
+}
+
+# Save QC results
+write.csv(qc_passed, file.path(output_dir, "qc_passed_samples.csv"), row.names = FALSE)
+write.csv(qc_failed, file.path(output_dir, "qc_failed_samples.csv"), row.names = FALSE)
+```
+
+# 10 Export Samples Ready for Variant Calling
+
+```{r export-qc-passed-for-variant-calling}
+# Create a manifest file for next step (variant calling)
+
+# Only include QC-passed samples for downstream analysis
+manifest <- qc_passed %>%
+  select(sample_id, bam_file) %>%
+  mutate(
+    vcf_output = paste0(output_dir, "/vcf/", sample_id, "_variants.vcf.gz"),
+    ready_for_variant_calling = TRUE
+  )
+
+manifest_file <- file.path(output_dir, "qc_passed_samples_manifest.csv")
+write.csv(manifest, manifest_file, row.names = FALSE)
+
+cat("\n=== SAMPLES READY FOR VARIANT CALLING ===\n")
+cat("Total samples:", nrow(manifest), "\n")
+cat("Manifest file:", manifest_file, "\n\n")
+
+# Display manifest
+print(manifest)
+
+# Provide instructions for next step
+cat("\n=== NEXT STEPS ===\n")
+cat("1. Use BAM files from 'bam_file' column for variant calling\n")
+cat("2. Run GATK Mutect2 or MitoHPC for each sample\n")
+cat("3. Output VCF files to locations specified in 'vcf_output' column\n")
+cat("4. Proceed to variant filtering and NUMT detection (Section 4-6)\n")
+```
+
+**Key outputs:**
+- `/alignment_results/bam_files/` — Aligned BAM files
+- `/alignment_results/alignment_stats/` — Per-sample statistics
+- `/alignment_results/logs/` — Detailed processing logs
+- `/alignment_results/batch_alignment_summary.csv` — Master summary table
+- `/alignment_results/qc_passed_samples_manifest.csv` — Samples ready for variant calling
